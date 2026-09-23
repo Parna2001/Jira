@@ -2,11 +2,11 @@
 """
 ADIRI Long-Pending Tasks Dashboard Generator
 Fetches open (statusCategory != Done) tasks in Jira project AD that were either
-created or last updated 3+ calendar months ago, and regenerates
-adiri-long-pending-dashboard.html.
+created or last updated 3+ calendar months ago, writes the results to
+docs/data.json, and regenerates docs/index.html (which fetches data.json
+at load time).
 """
 
-import base64
 import calendar
 import json
 import os
@@ -27,6 +27,7 @@ JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
 PROJECT_KEY = "AD"
 CUTOFF_MONTHS = 3
 OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "docs/index.html")
+DATA_PATH = os.environ.get("DATA_PATH", "docs/data.json")
 
 FIELDS = ["summary", "status", "labels", "assignee", "created", "updated", "priority"]
 
@@ -104,9 +105,20 @@ def build_record(issue: Dict) -> Dict:
     }
 
 
-def b64_json(records: List[Dict]) -> str:
-    payload = json.dumps(records, separators=(",", ":"), ensure_ascii=True)
-    return base64.b64encode(payload.encode("utf-8")).decode("ascii")
+def write_data_json(path: str, pull_datetime: datetime, cutoff_date: date, created_records: List[Dict], updated_records: List[Dict]) -> None:
+    """Write the fetched Jira data to a standalone JSON file that the dashboard HTML fetches at load time."""
+    payload = {
+        "pullDatetime": pull_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+        "cutoffDate": cutoff_date.isoformat(),
+        "months": CUTOFF_MONTHS,
+        "created": created_records,
+        "updated": updated_records,
+    }
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"), ensure_ascii=True)
 
 
 HEAD_TEMPLATE = r"""<!doctype html>
@@ -526,19 +538,8 @@ TAIL_TEMPLATE = r"""<script>
 (function () {
   "use strict";
 
-  function decodeB64Json(id) {
-    var b64 = document.getElementById(id).textContent.trim();
-    var bin = atob(b64);
-    var bytes = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    var text = new TextDecoder("utf-8").decode(bytes);
-    return JSON.parse(text);
-  }
-
-  var DATASETS = {
-    created: { records: decodeB64Json("data-created"), dateField: "created", dateLabel: "Created", basisLabel: "days since created" },
-    updated: { records: decodeB64Json("data-updated"), dateField: "updated", dateLabel: "Last updated", basisLabel: "days since last update" }
-  };
+  var DATA_URL = "data.json";
+  var DATASETS = null;
 
   var MS_PER_DAY = 86400000;
 
@@ -852,7 +853,28 @@ TAIL_TEMPLATE = r"""<script>
     });
   });
 
-  render();
+  function loadData() {
+    fetch(DATA_URL, { cache: "no-store" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        DATASETS = {
+          created: { records: data.created || [], dateField: "created", dateLabel: "Created", basisLabel: "days since created" },
+          updated: { records: data.updated || [], dateField: "updated", dateLabel: "Last updated", basisLabel: "days since last update" }
+        };
+        render();
+      })
+      .catch(function (err) {
+        els.summaryRow.innerHTML = "";
+        els.tbody.innerHTML = "";
+        els.noResults.textContent = "Failed to load data.json: " + err.message + " (this page must be served over http/https, not opened directly as a file).";
+        els.noResults.style.display = "block";
+      });
+  }
+
+  loadData();
 })();
 </script>
 </body>
@@ -860,18 +882,15 @@ TAIL_TEMPLATE = r"""<script>
 """
 
 
-def generate_html(pull_datetime: datetime, cutoff_date: date, created_records: List[Dict], updated_records: List[Dict]) -> str:
+def generate_html(pull_datetime: datetime, cutoff_date: date, created_count: int, updated_count: int) -> str:
     head = HEAD_TEMPLATE
     head = head.replace("__PULL_DATETIME__", pull_datetime.strftime("%Y-%m-%d %H:%M:%S"))
     head = head.replace("__CUTOFF_DATE__", cutoff_date.isoformat())
     head = head.replace("__MONTHS__", str(CUTOFF_MONTHS))
-    head = head.replace("__CREATED_COUNT__", f"{len(created_records):,}")
-    head = head.replace("__UPDATED_COUNT__", f"{len(updated_records):,}")
+    head = head.replace("__CREATED_COUNT__", f"{created_count:,}")
+    head = head.replace("__UPDATED_COUNT__", f"{updated_count:,}")
 
-    data_created = '<script id="data-created" type="application/octet-stream">' + b64_json(created_records) + "</script>\n"
-    data_updated = '<script id="data-updated" type="application/octet-stream">' + b64_json(updated_records) + "</script>\n"
-
-    return head + data_created + data_updated + TAIL_TEMPLATE
+    return head + TAIL_TEMPLATE
 
 
 def main():
@@ -902,7 +921,10 @@ def main():
     created_records = [build_record(issue) for issue in created_issues]
     updated_records = [build_record(issue) for issue in updated_issues]
 
-    html = generate_html(pull_datetime, cutoff_date, created_records, updated_records)
+    write_data_json(DATA_PATH, pull_datetime, cutoff_date, created_records, updated_records)
+    print(f"Data saved to: {DATA_PATH}")
+
+    html = generate_html(pull_datetime, cutoff_date, len(created_records), len(updated_records))
     output_dir = os.path.dirname(OUTPUT_PATH)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
