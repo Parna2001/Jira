@@ -451,6 +451,8 @@ HEAD_TEMPLATE = r"""<!doctype html>
     margin-bottom: 10px;
   }
   .chart-card svg { display: block; max-width: 100%; }
+  .chart-scroll { overflow-x: auto; }
+  .chart-scroll svg { max-width: none; }
   .chart-track { fill: var(--grid); }
   .chart-bar { fill: var(--series-1); }
   .chart-axis-label { fill: var(--text-secondary); font-size: 11px; }
@@ -671,32 +673,24 @@ TAIL_TEMPLATE = r"""<script>
     }
 
     var svgNS = "http://www.w3.org/2000/svg";
-    var rowH = 22, barGap = 6, topPad = 6, leftPad = 150, rightPad = 44, chartWidth = 800;
-    var barsAreaWidth = chartWidth - leftPad - rightPad;
-    var height = topPad * 2 + data.length * (rowH + barGap) - barGap;
+    var barW = 46, barGap = 18, topPad = 22, bottomPad = 96, leftPad = 24, rightPad = 24;
+    var barsAreaHeight = 240;
+    var barsAreaWidth = data.length * (barW + barGap) - barGap;
+    var chartWidth = leftPad + rightPad + barsAreaWidth;
+    var height = topPad + barsAreaHeight + bottomPad;
     var maxCount = data[0].count;
 
     var svg = document.createElementNS(svgNS, "svg");
     svg.setAttribute("viewBox", "0 0 " + chartWidth + " " + height);
-    svg.setAttribute("width", "100%");
+    svg.setAttribute("width", chartWidth);
     svg.setAttribute("height", height);
     svg.setAttribute("role", "img");
     svg.setAttribute("aria-label", "Long-pending tasks by assignee");
 
     data.forEach(function (d, i) {
-      var y = topPad + i * (rowH + barGap);
-      var barW = maxCount > 0 ? (d.count / maxCount) * barsAreaWidth : 0;
-
-      var label = document.createElementNS(svgNS, "text");
-      label.setAttribute("x", leftPad - 8);
-      label.setAttribute("y", y + rowH / 2 + 4);
-      label.setAttribute("text-anchor", "end");
-      label.setAttribute("class", "chart-axis-label");
-      label.textContent = d.name;
-      var title = document.createElementNS(svgNS, "title");
-      title.textContent = d.name;
-      label.appendChild(title);
-      svg.appendChild(label);
+      var x = leftPad + i * (barW + barGap);
+      var barH = maxCount > 0 ? (d.count / maxCount) * barsAreaHeight : 0;
+      var y = topPad + (barsAreaHeight - barH);
 
       var group = document.createElementNS(svgNS, "g");
       group.setAttribute("class", "chart-bar-group");
@@ -713,30 +707,46 @@ TAIL_TEMPLATE = r"""<script>
       group.appendChild(groupTitle);
 
       var track = document.createElementNS(svgNS, "rect");
-      track.setAttribute("x", leftPad);
-      track.setAttribute("y", y);
-      track.setAttribute("width", barsAreaWidth);
-      track.setAttribute("height", rowH);
+      track.setAttribute("x", x);
+      track.setAttribute("y", topPad);
+      track.setAttribute("width", barW);
+      track.setAttribute("height", barsAreaHeight);
       track.setAttribute("class", "chart-track");
       group.appendChild(track);
 
       var bar = document.createElementNS(svgNS, "rect");
-      bar.setAttribute("x", leftPad);
+      bar.setAttribute("x", x);
       bar.setAttribute("y", y);
-      bar.setAttribute("width", Math.max(barW, d.count > 0 ? 2 : 0));
-      bar.setAttribute("height", rowH);
+      bar.setAttribute("width", barW);
+      bar.setAttribute("height", Math.max(barH, d.count > 0 ? 2 : 0));
       bar.setAttribute("class", "chart-bar");
       group.appendChild(bar);
 
       var val = document.createElementNS(svgNS, "text");
-      val.setAttribute("x", leftPad + barW + 6);
-      val.setAttribute("y", y + rowH / 2 + 4);
+      val.setAttribute("x", x + barW / 2);
+      val.setAttribute("y", y - 6);
+      val.setAttribute("text-anchor", "middle");
       val.setAttribute("class", "chart-value-label");
       val.textContent = d.count.toLocaleString();
       svg.appendChild(val);
+
+      var label = document.createElementNS(svgNS, "text");
+      label.setAttribute("x", x + barW / 2);
+      label.setAttribute("y", topPad + barsAreaHeight + 14);
+      label.setAttribute("text-anchor", "end");
+      label.setAttribute("transform", "rotate(-40 " + (x + barW / 2) + " " + (topPad + barsAreaHeight + 14) + ")");
+      label.setAttribute("class", "chart-axis-label");
+      label.textContent = d.name;
+      var title = document.createElementNS(svgNS, "title");
+      title.textContent = d.name;
+      label.appendChild(title);
+      svg.appendChild(label);
     });
 
-    container.appendChild(svg);
+    var scrollWrap = document.createElement("div");
+    scrollWrap.className = "chart-scroll";
+    scrollWrap.appendChild(svg);
+    container.appendChild(scrollWrap);
   }
 
   function applyFiltersSort(rows) {
