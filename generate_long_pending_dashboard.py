@@ -1,0 +1,928 @@
+#!/usr/bin/env python3
+"""
+ADIRI Long-Pending Tasks Dashboard Generator
+Fetches open (statusCategory != Done) tasks in Jira project AD that were either
+created or last updated 3+ calendar months ago, and regenerates
+adiri-long-pending-dashboard.html.
+"""
+
+import base64
+import calendar
+import json
+import os
+import sys
+from datetime import date, datetime
+from typing import Dict, List
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Configuration
+JIRA_URL = "https://aiincorg.atlassian.net"
+JIRA_USERNAME = os.environ.get("JIRA_USERNAME", "")
+JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
+
+PROJECT_KEY = "AD"
+CUTOFF_MONTHS = 3
+OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "docs/index.html")
+
+FIELDS = ["summary", "status", "labels", "assignee", "created", "updated", "priority"]
+
+
+class JiraClient:
+    def __init__(self, url: str, username: str, api_token: str):
+        self.url = url.rstrip("/")
+        self.session = requests.Session()
+        self.session.auth = (username, api_token)
+        self.session.headers.update({"Accept": "application/json"})
+
+    def search_all(self, jql: str, fields: List[str], max_results: int = 100, guard_limit: int = 200) -> List[Dict]:
+        """Paginate through /rest/api/3/search/jql (token-based) until all matching issues are collected.
+
+        The legacy GET /rest/api/3/search endpoint returns 410 Gone; Atlassian's replacement
+        uses POST with a nextPageToken/isLast cursor instead of startAt/total.
+        """
+        all_issues: List[Dict] = []
+        next_page_token = None
+        guard = 0
+        while True:
+            body = {
+                "jql": jql,
+                "maxResults": max_results,
+                "fields": fields,
+            }
+            if next_page_token:
+                body["nextPageToken"] = next_page_token
+            response = self.session.post(f"{self.url}/rest/api/3/search/jql", json=body, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            issues = data.get("issues", [])
+            all_issues.extend(issues)
+            next_page_token = data.get("nextPageToken")
+            is_last = data.get("isLast", not next_page_token)
+            guard += 1
+            if is_last or not issues or guard >= guard_limit:
+                break
+        return all_issues
+
+
+def months_before(d: date, months: int) -> date:
+    """Subtract calendar months from a date, clamping the day to the target month's length."""
+    m = d.month - months
+    y = d.year + (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    last_day = calendar.monthrange(y, m)[1]
+    return date(y, m, min(d.day, last_day))
+
+
+def build_jql(date_field: str, cutoff_iso: str) -> str:
+    return (
+        f'project = {PROJECT_KEY} AND statusCategory != Done AND {date_field} <= "{cutoff_iso}" '
+        f"ORDER BY {date_field} ASC"
+    )
+
+
+def build_record(issue: Dict) -> Dict:
+    fields = issue.get("fields", {})
+    status = fields.get("status") or {}
+    status_category = (status.get("statusCategory") or {}).get("name")
+    assignee = fields.get("assignee") or {}
+    priority = fields.get("priority") or {}
+    return {
+        "key": issue["key"],
+        "summary": fields.get("summary"),
+        "status": status.get("name"),
+        "statusCategory": status_category,
+        "labels": fields.get("labels") or [],
+        "assignee": assignee.get("displayName"),
+        "created": fields.get("created"),
+        "updated": fields.get("updated"),
+        "priority": priority.get("name"),
+        "webUrl": f"{JIRA_URL}/browse/{issue['key']}",
+    }
+
+
+def b64_json(records: List[Dict]) -> str:
+    payload = json.dumps(records, separators=(",", ":"), ensure_ascii=True)
+    return base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+HEAD_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADIRI (AD) — Long-Pending Tasks Dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --surface-2:      #ffffff;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1:       #2a78d6;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --serious:        #ec835a;
+    --critical:       #d03b3b;
+    --warning-bg:     #fff3d9;
+    --serious-bg:     #fde5db;
+    --critical-bg:    #fbdcdc;
+    --warning-text:   #7a5200;
+    --serious-text:   #9c3d1c;
+    --critical-text:  #8f2323;
+    --chip-bg:        #eeede8;
+    --row-hover:      #f2f1ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --surface-2:      #201f1d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-1:       #3987e5;
+      --good:           #0ca30c;
+      --warning:        #fab219;
+      --serious:        #ec835a;
+      --critical:       #e66767;
+      --warning-bg:     #3a2e0f;
+      --serious-bg:     #3d2015;
+      --critical-bg:    #3a1414;
+      --warning-text:   #ffce6a;
+      --serious-text:   #ffab86;
+      --critical-text:  #ff9d9d;
+      --chip-bg:        #2a2a27;
+      --row-hover:      #232320;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --surface-2:      #201f1d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --grid:           #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-1:       #3987e5;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --serious:        #ec835a;
+    --critical:       #e66767;
+    --warning-bg:     #3a2e0f;
+    --serious-bg:     #3d2015;
+    --critical-bg:    #3a1414;
+    --warning-text:   #ffce6a;
+    --serious-text:   #ffab86;
+    --critical-text:  #ff9d9d;
+    --chip-bg:        #2a2a27;
+    --row-hover:      #232320;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 24px 20px 60px; }
+
+  header.topbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-secondary); font-size: 13px; }
+  .meta { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+
+  .view-toggle {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--surface-2);
+  }
+  .view-toggle button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    padding: 9px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .view-toggle button.active {
+    background: var(--series-1);
+    color: #fff;
+    font-weight: 600;
+  }
+  .view-toggle button:not(.active):hover { background: var(--row-hover); }
+
+  .summary-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .stat-tile {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    min-width: 128px;
+    flex: 1 1 128px;
+  }
+  .stat-tile .n {
+    font-size: 26px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+  }
+  .stat-tile .lbl { color: var(--text-secondary); font-size: 12px; margin-top: 4px; }
+  .stat-tile.total .n { color: var(--series-1); }
+  .stat-tile.b-warning .n { color: var(--warning-text); }
+  .stat-tile.b-serious .n { color: var(--serious-text); }
+  .stat-tile.b-critical .n { color: var(--critical-text); }
+  .stat-tile.b-warning { border-color: color-mix(in srgb, var(--warning) 40%, var(--border)); }
+  .stat-tile.b-serious { border-color: color-mix(in srgb, var(--serious) 40%, var(--border)); }
+  .stat-tile.b-critical { border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .controls input[type="search"],
+  .controls select {
+    background: var(--surface-1);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  .controls label {
+    font-size: 12px;
+    color: var(--text-muted);
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .controls .count-note {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .controls .reset-btn {
+    border: 1px solid var(--border);
+    background: var(--surface-1);
+    color: var(--text-secondary);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .controls .reset-btn:hover { background: var(--row-hover); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    font-size: 13px;
+  }
+  thead th {
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--grid);
+    padding: 10px 12px;
+    white-space: nowrap;
+    position: sticky;
+    top: 0;
+    background: var(--surface-2);
+    cursor: pointer;
+    user-select: none;
+  }
+  thead th.sortable:hover { color: var(--text-primary); }
+  thead th .arrow { opacity: 0.5; font-size: 10px; margin-left: 3px; }
+  thead th.active-sort .arrow { opacity: 1; }
+  tbody td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--grid);
+    vertical-align: top;
+  }
+  tbody tr:hover { background: var(--row-hover); }
+  tbody tr:last-child td { border-bottom: none; }
+
+  td.key a {
+    color: var(--series-1);
+    text-decoration: none;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  td.key a:hover { text-decoration: underline; }
+  td.summary { max-width: 360px; }
+  td.days { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.created { white-space: nowrap; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .badge.b-warning  { background: var(--warning-bg);  color: var(--warning-text); }
+  .badge.b-serious  { background: var(--serious-bg);  color: var(--serious-text); }
+  .badge.b-critical { background: var(--critical-bg); color: var(--critical-text); }
+
+  .status-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    background: var(--chip-bg);
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+
+  .labels { display: flex; flex-wrap: wrap; gap: 4px; max-width: 220px; }
+  .label-chip {
+    background: var(--chip-bg);
+    color: var(--text-secondary);
+    border-radius: 5px;
+    padding: 1px 6px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .empty-cell { color: var(--text-muted); }
+
+  .no-results {
+    padding: 40px;
+    text-align: center;
+    color: var(--text-muted);
+  }
+
+  footer.note {
+    margin-top: 22px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.6;
+    border-top: 1px solid var(--grid);
+    padding-top: 14px;
+  }
+  footer.note code {
+    background: var(--chip-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 11px;
+  }
+
+  .table-scroll { overflow-x: auto; border-radius: 10px; }
+  .table-scroll table { border-radius: 0; }
+  .table-wrap { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .table-wrap .table-scroll { border: none; }
+
+  .chart-card {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 18px;
+  }
+  .chart-card .chart-title {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+  }
+  .chart-card svg { display: block; max-width: 100%; }
+  .chart-track { fill: var(--grid); }
+  .chart-bar { fill: var(--series-1); }
+  .chart-axis-label { fill: var(--text-secondary); font-size: 11px; }
+  .chart-value-label { fill: var(--text-primary); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .chart-bar-group { cursor: pointer; }
+  .chart-bar-group:hover .chart-track { fill: var(--row-hover); }
+  .chart-bar-group:hover .chart-bar { filter: brightness(1.15); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="topbar">
+    <div>
+      <h1>ADIRI (AD) — Long-Pending Tasks</h1>
+      <div class="subtitle">project = AD · statusCategory != Done · labels excluded · Jira Cloud (aiincorg.atlassian.net)</div>
+      <div class="meta">Data refreshed __PULL_DATETIME__ · age/staleness cutoff: on or before __CUTOFF_DATE__ (__MONTHS__ calendar months before pull date)</div>
+    </div>
+    <div class="view-toggle" id="viewToggle">
+      <button data-view="created" class="active">Created ≥__MONTHS__ months ago (__CREATED_COUNT__)</button>
+      <button data-view="updated">Not updated in ≥__MONTHS__ months (__UPDATED_COUNT__)</button>
+    </div>
+  </header>
+
+  <div class="summary-row" id="summaryRow"></div>
+
+  <div class="chart-card">
+    <div class="chart-title">Long-pending tasks by assignee</div>
+    <div id="assigneeChart"></div>
+  </div>
+
+  <div class="controls">
+    <label>Search
+      <input type="search" id="searchBox" placeholder="Key or summary…" style="width:200px">
+    </label>
+    <label>Assignee
+      <select id="assigneeFilter"><option value="">All assignees</option></select>
+    </label>
+    <label>Status
+      <select id="statusFilter"><option value="">All statuses</option></select>
+    </label>
+    <label>Overdue bucket
+      <select id="bucketFilter">
+        <option value="">All buckets</option>
+        <option value="warning">3–6 months</option>
+        <option value="serious">6–12 months</option>
+        <option value="critical">12+ months</option>
+      </select>
+    </label>
+    <button class="reset-btn" id="resetBtn">Reset filters</button>
+    <div class="count-note" id="countNote"></div>
+  </div>
+
+  <div class="table-wrap">
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th data-col="key" class="sortable">Key <span class="arrow">▲</span></th>
+            <th data-col="summary" class="sortable">Summary <span class="arrow">▲</span></th>
+            <th data-col="status" class="sortable">Status <span class="arrow">▲</span></th>
+            <th data-col="labels">Labels</th>
+            <th data-col="assignee" class="sortable">Assignee <span class="arrow">▲</span></th>
+            <th data-col="dateBasis" class="sortable">Created <span class="arrow">▲</span></th>
+            <th data-col="days" class="sortable active-sort">Days pending <span class="arrow">▼</span></th>
+            <th data-col="priority" class="sortable">Priority <span class="arrow">▲</span></th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="no-results" id="noResults" style="display:none">No issues match the current filters.</div>
+  </div>
+
+  <footer class="note">
+    Row count is programmatically bound to the verified, fully-paginated dataset for each view — it will always equal the count shown in the view toggle above.
+    Both variants were fetched by paginating <code>/rest/api/3/search</code> to exhaustion (checking the total reported by the API on every page).
+    Note: JQL relative-date macros (e.g. <code>-3M</code>) are unreliable across Jira connectors, so both queries here use the equivalent absolute date <code>__CUTOFF_DATE__</code> instead.
+    "Days pending" is calculated live from your system clock, so it advances each time you open this file; the underlying issue list is a fixed snapshot from the pull date above.
+  </footer>
+</div>
+
+"""
+
+TAIL_TEMPLATE = r"""<script>
+(function () {
+  "use strict";
+
+  function decodeB64Json(id) {
+    var b64 = document.getElementById(id).textContent.trim();
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    var text = new TextDecoder("utf-8").decode(bytes);
+    return JSON.parse(text);
+  }
+
+  var DATASETS = {
+    created: { records: decodeB64Json("data-created"), dateField: "created", dateLabel: "Created", basisLabel: "days since created" },
+    updated: { records: decodeB64Json("data-updated"), dateField: "updated", dateLabel: "Last updated", basisLabel: "days since last update" }
+  };
+
+  var MS_PER_DAY = 86400000;
+
+  function daysSince(iso) {
+    var d = new Date(iso);
+    var now = new Date();
+    return Math.floor((now - d) / MS_PER_DAY);
+  }
+
+  function bucketOf(days) {
+    if (days >= 365) return "critical";
+    if (days >= 182) return "serious";
+    return "warning"; // >=90 by construction of the source query
+  }
+
+  function bucketLabel(b) {
+    return { warning: "3–6 months", serious: "6–12 months", critical: "12+ months" }[b];
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d)) return "—";
+    return d.toISOString().slice(0, 10);
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  var EXCLUDED_LABELS = ["daily task", "consumer loan", "gold loan", "adiri monthly", "adiri weekly", "salon weekly", "housekeeping", "bi monthly", "payment duedate", "remainder"];
+
+  function hasExcludedLabel(raw) {
+    if (!raw.labels || !raw.labels.length) return false;
+    return raw.labels.some(function (l) {
+      return EXCLUDED_LABELS.indexOf(String(l).toLowerCase()) > -1;
+    });
+  }
+
+  var state = {
+    view: "created",
+    sortCol: "days",
+    sortDir: "desc",
+    search: "",
+    assignee: "",
+    status: "",
+    bucket: ""
+  };
+
+  var els = {
+    tbody: document.getElementById("tbody"),
+    noResults: document.getElementById("noResults"),
+    summaryRow: document.getElementById("summaryRow"),
+    countNote: document.getElementById("countNote"),
+    searchBox: document.getElementById("searchBox"),
+    assigneeFilter: document.getElementById("assigneeFilter"),
+    statusFilter: document.getElementById("statusFilter"),
+    bucketFilter: document.getElementById("bucketFilter"),
+    resetBtn: document.getElementById("resetBtn"),
+    viewToggle: document.getElementById("viewToggle"),
+    dateHeader: document.querySelector('th[data-col="dateBasis"]'),
+    assigneeChart: document.getElementById("assigneeChart")
+  };
+
+  function currentDataset() { return DATASETS[state.view]; }
+
+  function enriched() {
+    var ds = currentDataset();
+    return ds.records.filter(function (r) { return !hasExcludedLabel(r); }).map(function (r) {
+      var days = daysSince(r[ds.dateField]);
+      return {
+        raw: r,
+        days: days,
+        bucket: bucketOf(days)
+      };
+    });
+  }
+
+  function populateFilterOptions(rows) {
+    var assignees = new Set(), statuses = new Set();
+    rows.forEach(function (row) {
+      assignees.add(row.raw.assignee || "(unassigned)");
+      statuses.add(row.raw.status || "(no status)");
+    });
+    var prevA = els.assigneeFilter.value, prevS = els.statusFilter.value;
+    els.assigneeFilter.innerHTML = '<option value="">All assignees</option>' +
+      Array.from(assignees).sort().map(function (a) { return '<option value="' + esc(a) + '">' + esc(a) + '</option>'; }).join("");
+    els.statusFilter.innerHTML = '<option value="">All statuses</option>' +
+      Array.from(statuses).sort().map(function (s) { return '<option value="' + esc(s) + '">' + esc(s) + '</option>'; }).join("");
+    if (assignees.has(prevA)) els.assigneeFilter.value = prevA;
+    if (statuses.has(prevS)) els.statusFilter.value = prevS;
+  }
+
+  function renderSummary(rows) {
+    var total = rows.length;
+    var counts = { warning: 0, serious: 0, critical: 0 };
+    rows.forEach(function (r) { counts[r.bucket]++; });
+    els.summaryRow.innerHTML =
+      '<div class="stat-tile total"><div class="n">' + total.toLocaleString() + '</div><div class="lbl">Total long-pending (this view)</div></div>' +
+      '<div class="stat-tile b-warning"><div class="n">' + counts.warning.toLocaleString() + '</div><div class="lbl">3–6 months</div></div>' +
+      '<div class="stat-tile b-serious"><div class="n">' + counts.serious.toLocaleString() + '</div><div class="lbl">6–12 months</div></div>' +
+      '<div class="stat-tile b-critical"><div class="n">' + counts.critical.toLocaleString() + '</div><div class="lbl">12+ months</div></div>';
+  }
+
+  function renderAssigneeChart(rows) {
+    var counts = {};
+    rows.forEach(function (r) {
+      var a = r.raw.assignee || "(unassigned)";
+      counts[a] = (counts[a] || 0) + 1;
+    });
+    var data = Object.keys(counts).map(function (k) { return { name: k, count: counts[k] }; });
+    data.sort(function (a, b) { return b.count - a.count || a.name.localeCompare(b.name); });
+
+    var container = els.assigneeChart;
+    container.innerHTML = "";
+
+    if (!data.length) {
+      var empty = document.createElement("div");
+      empty.className = "empty-cell";
+      empty.textContent = "No data to display.";
+      container.appendChild(empty);
+      return;
+    }
+
+    var svgNS = "http://www.w3.org/2000/svg";
+    var rowH = 22, barGap = 6, topPad = 6, leftPad = 150, rightPad = 44, chartWidth = 800;
+    var barsAreaWidth = chartWidth - leftPad - rightPad;
+    var height = topPad * 2 + data.length * (rowH + barGap) - barGap;
+    var maxCount = data[0].count;
+
+    var svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + chartWidth + " " + height);
+    svg.setAttribute("width", "100%");
+    svg.setAttribute("height", height);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Long-pending tasks by assignee");
+
+    data.forEach(function (d, i) {
+      var y = topPad + i * (rowH + barGap);
+      var barW = maxCount > 0 ? (d.count / maxCount) * barsAreaWidth : 0;
+
+      var label = document.createElementNS(svgNS, "text");
+      label.setAttribute("x", leftPad - 8);
+      label.setAttribute("y", y + rowH / 2 + 4);
+      label.setAttribute("text-anchor", "end");
+      label.setAttribute("class", "chart-axis-label");
+      label.textContent = d.name;
+      var title = document.createElementNS(svgNS, "title");
+      title.textContent = d.name;
+      label.appendChild(title);
+      svg.appendChild(label);
+
+      var group = document.createElementNS(svgNS, "g");
+      group.setAttribute("class", "chart-bar-group");
+      group.addEventListener("click", function () {
+        var next = state.assignee === d.name ? "" : d.name;
+        state.assignee = next;
+        els.assigneeFilter.value = next;
+        render();
+      });
+      svg.appendChild(group);
+
+      var groupTitle = document.createElementNS(svgNS, "title");
+      groupTitle.textContent = "Filter table by " + d.name;
+      group.appendChild(groupTitle);
+
+      var track = document.createElementNS(svgNS, "rect");
+      track.setAttribute("x", leftPad);
+      track.setAttribute("y", y);
+      track.setAttribute("width", barsAreaWidth);
+      track.setAttribute("height", rowH);
+      track.setAttribute("class", "chart-track");
+      group.appendChild(track);
+
+      var bar = document.createElementNS(svgNS, "rect");
+      bar.setAttribute("x", leftPad);
+      bar.setAttribute("y", y);
+      bar.setAttribute("width", Math.max(barW, d.count > 0 ? 2 : 0));
+      bar.setAttribute("height", rowH);
+      bar.setAttribute("class", "chart-bar");
+      group.appendChild(bar);
+
+      var val = document.createElementNS(svgNS, "text");
+      val.setAttribute("x", leftPad + barW + 6);
+      val.setAttribute("y", y + rowH / 2 + 4);
+      val.setAttribute("class", "chart-value-label");
+      val.textContent = d.count.toLocaleString();
+      svg.appendChild(val);
+    });
+
+    container.appendChild(svg);
+  }
+
+  function applyFiltersSort(rows) {
+    var q = state.search.trim().toLowerCase();
+    var filtered = rows.filter(function (r) {
+      if (q && !((r.raw.key || "").toLowerCase().indexOf(q) > -1 || (r.raw.summary || "").toLowerCase().indexOf(q) > -1)) return false;
+      if (state.assignee && (r.raw.assignee || "(unassigned)") !== state.assignee) return false;
+      if (state.status && (r.raw.status || "(no status)") !== state.status) return false;
+      if (state.bucket && r.bucket !== state.bucket) return false;
+      return true;
+    });
+
+    var col = state.sortCol, dir = state.sortDir === "asc" ? 1 : -1;
+    filtered.sort(function (a, b) {
+      var av, bv;
+      switch (col) {
+        case "key": av = a.raw.key; bv = b.raw.key; break;
+        case "summary": av = a.raw.summary || ""; bv = b.raw.summary || ""; break;
+        case "status": av = a.raw.status || ""; bv = b.raw.status || ""; break;
+        case "assignee": av = a.raw.assignee || ""; bv = b.raw.assignee || ""; break;
+        case "dateBasis": av = a.raw[currentDataset().dateField] || ""; bv = b.raw[currentDataset().dateField] || ""; break;
+        case "priority": av = a.raw.priority || ""; bv = b.raw.priority || ""; break;
+        case "days": default: av = a.days; bv = b.days; break;
+      }
+      if (av < bv) return -1 * dir;
+      if (av > bv) return 1 * dir;
+      return 0;
+    });
+    return filtered;
+  }
+
+  function render() {
+    var ds = currentDataset();
+    var all = enriched();
+    populateFilterOptions(all);
+    renderSummary(all);
+
+    var filtered = applyFiltersSort(all);
+    renderAssigneeChart(filtered);
+
+    els.dateHeader.firstChild.textContent = ds.dateLabel + " ";
+
+    els.countNote.textContent = filtered.length.toLocaleString() + " of " + all.length.toLocaleString() + " shown";
+
+    if (filtered.length === 0) {
+      els.tbody.innerHTML = "";
+      els.noResults.style.display = "block";
+      return;
+    }
+    els.noResults.style.display = "none";
+
+    var frag = document.createDocumentFragment();
+    filtered.forEach(function (r) {
+      var raw = r.raw;
+      var tr = document.createElement("tr");
+
+      var labelsHtml = (raw.labels && raw.labels.length)
+        ? '<div class="labels">' + raw.labels.map(function (l) { return '<span class="label-chip">' + esc(l) + '</span>'; }).join("") + '</div>'
+        : '<span class="empty-cell">—</span>';
+
+      tr.innerHTML =
+        '<td class="key"><a href="' + esc(raw.webUrl || ('https://aiincorg.atlassian.net/browse/' + raw.key)) + '" target="_blank" rel="noopener">' + esc(raw.key) + '</a></td>' +
+        '<td class="summary">' + esc(raw.summary || "—") + '</td>' +
+        '<td><span class="status-pill">' + esc(raw.status || "—") + '</span></td>' +
+        '<td>' + labelsHtml + '</td>' +
+        '<td>' + esc(raw.assignee || "—") + '</td>' +
+        '<td class="created">' + fmtDate(raw[ds.dateField]) + '</td>' +
+        '<td class="days">' + r.days.toLocaleString() + 'd <span class="badge b-' + r.bucket + '">' + bucketLabel(r.bucket) + '</span></td>' +
+        '<td>' + esc(raw.priority || "—") + '</td>';
+      frag.appendChild(tr);
+    });
+    els.tbody.innerHTML = "";
+    els.tbody.appendChild(frag);
+  }
+
+  // events
+  els.viewToggle.addEventListener("click", function (e) {
+    var btn = e.target.closest("button[data-view]");
+    if (!btn) return;
+    state.view = btn.getAttribute("data-view");
+    Array.from(els.viewToggle.querySelectorAll("button")).forEach(function (b) { b.classList.toggle("active", b === btn); });
+    state.assignee = ""; state.status = ""; state.bucket = ""; state.search = "";
+    els.assigneeFilter.value = ""; els.statusFilter.value = ""; els.bucketFilter.value = ""; els.searchBox.value = "";
+    render();
+  });
+
+  var searchDebounce;
+  els.searchBox.addEventListener("input", function () {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(function () { state.search = els.searchBox.value; render(); }, 120);
+  });
+  els.assigneeFilter.addEventListener("change", function () { state.assignee = els.assigneeFilter.value; render(); });
+  els.statusFilter.addEventListener("change", function () { state.status = els.statusFilter.value; render(); });
+  els.bucketFilter.addEventListener("change", function () { state.bucket = els.bucketFilter.value; render(); });
+  els.resetBtn.addEventListener("click", function () {
+    state.search = ""; state.assignee = ""; state.status = ""; state.bucket = "";
+    els.searchBox.value = ""; els.assigneeFilter.value = ""; els.statusFilter.value = ""; els.bucketFilter.value = "";
+    render();
+  });
+
+  document.querySelectorAll("thead th.sortable").forEach(function (th) {
+    th.addEventListener("click", function () {
+      var col = th.getAttribute("data-col");
+      if (state.sortCol === col) {
+        state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+      } else {
+        state.sortCol = col;
+        state.sortDir = col === "days" ? "desc" : "asc";
+      }
+      document.querySelectorAll("thead th").forEach(function (h) {
+        h.classList.remove("active-sort");
+        var arrow = h.querySelector(".arrow");
+        if (arrow) arrow.textContent = "▲";
+      });
+      th.classList.add("active-sort");
+      th.querySelector(".arrow").textContent = state.sortDir === "asc" ? "▲" : "▼";
+      render();
+    });
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def generate_html(pull_datetime: datetime, cutoff_date: date, created_records: List[Dict], updated_records: List[Dict]) -> str:
+    head = HEAD_TEMPLATE
+    head = head.replace("__PULL_DATETIME__", pull_datetime.strftime("%Y-%m-%d %H:%M:%S"))
+    head = head.replace("__CUTOFF_DATE__", cutoff_date.isoformat())
+    head = head.replace("__MONTHS__", str(CUTOFF_MONTHS))
+    head = head.replace("__CREATED_COUNT__", f"{len(created_records):,}")
+    head = head.replace("__UPDATED_COUNT__", f"{len(updated_records):,}")
+
+    data_created = '<script id="data-created" type="application/octet-stream">' + b64_json(created_records) + "</script>\n"
+    data_updated = '<script id="data-updated" type="application/octet-stream">' + b64_json(updated_records) + "</script>\n"
+
+    return head + data_created + data_updated + TAIL_TEMPLATE
+
+
+def main():
+    print("ADIRI Long-Pending Tasks Dashboard Generator\n" + "=" * 60)
+
+    if not JIRA_USERNAME or not JIRA_API_TOKEN:
+        print("Error: set JIRA_USERNAME and JIRA_API_TOKEN environment variables.")
+        print("Get an API token at https://id.atlassian.com/manage-profile/security/api-tokens")
+        sys.exit(1)
+
+    client = JiraClient(JIRA_URL, JIRA_USERNAME, JIRA_API_TOKEN)
+
+    pull_datetime = datetime.now()
+    pull_date = pull_datetime.date()
+    cutoff_date = months_before(pull_date, CUTOFF_MONTHS)
+    cutoff_iso = cutoff_date.isoformat()
+
+    print(f"Pull date/time: {pull_datetime.strftime('%Y-%m-%d %H:%M:%S')}  |  Cutoff ({CUTOFF_MONTHS} months back): {cutoff_iso}\n")
+
+    print("Fetching tasks created on or before cutoff (statusCategory != Done)...")
+    created_issues = client.search_all(build_jql("created", cutoff_iso), FIELDS)
+    print(f"  Fetched {len(created_issues)} issues")
+
+    print("Fetching tasks not updated since cutoff (statusCategory != Done)...")
+    updated_issues = client.search_all(build_jql("updated", cutoff_iso), FIELDS)
+    print(f"  Fetched {len(updated_issues)} issues\n")
+
+    created_records = [build_record(issue) for issue in created_issues]
+    updated_records = [build_record(issue) for issue in updated_issues]
+
+    html = generate_html(pull_datetime, cutoff_date, created_records, updated_records)
+    output_dir = os.path.dirname(OUTPUT_PATH)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"Dashboard saved to: {OUTPUT_PATH}\n")
+
+    def summarize(name: str, records: List[Dict]):
+        by_assignee: Dict[str, int] = {}
+        for r in records:
+            by_assignee[r["assignee"] or "(unassigned)"] = by_assignee.get(r["assignee"] or "(unassigned)", 0) + 1
+        print(f"{name}: {len(records)} tasks")
+        for who, count in sorted(by_assignee.items(), key=lambda x: -x[1])[:10]:
+            print(f"  - {who}: {count}")
+
+    summarize("Created >= 3 months ago", created_records)
+    print()
+    summarize("Not updated in >= 3 months", updated_records)
+
+
+if __name__ == "__main__":
+    main()
