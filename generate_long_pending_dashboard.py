@@ -466,11 +466,11 @@ HEAD_TEMPLATE = r"""<!doctype html>
     <div>
       <h1>ADIRI (AD) — Long-Pending Tasks</h1>
       <div class="subtitle">project = AD · statusCategory != Done · labels excluded · Jira Cloud (aiincorg.atlassian.net)</div>
-      <div class="meta">Data refreshed __PULL_DATETIME__ · age/staleness cutoff: on or before __CUTOFF_DATE__ (__MONTHS__ calendar months before pull date)</div>
+      <div class="meta"><span id="metaMain">Data refreshed __PULL_DATETIME__ · age/staleness cutoff: on or before __CUTOFF_DATE__ (__MONTHS__ calendar months before pull date)</span> · <span id="autoRefreshNote">auto-refreshing…</span></div>
     </div>
     <div class="view-toggle" id="viewToggle">
-      <button data-view="created" class="active">Created ≥__MONTHS__ months ago (__CREATED_COUNT__)</button>
-      <button data-view="updated">Not updated in ≥__MONTHS__ months (__UPDATED_COUNT__)</button>
+      <button data-view="created" class="active">Created ≥__MONTHS__ months ago (<span id="createdCount">__CREATED_COUNT__</span>)</button>
+      <button data-view="updated">Not updated in ≥__MONTHS__ months (<span id="updatedCount">__UPDATED_COUNT__</span>)</button>
     </div>
   </header>
 
@@ -603,7 +603,11 @@ TAIL_TEMPLATE = r"""<script>
     resetBtn: document.getElementById("resetBtn"),
     viewToggle: document.getElementById("viewToggle"),
     dateHeader: document.querySelector('th[data-col="dateBasis"]'),
-    assigneeChart: document.getElementById("assigneeChart")
+    assigneeChart: document.getElementById("assigneeChart"),
+    metaMain: document.getElementById("metaMain"),
+    autoRefreshNote: document.getElementById("autoRefreshNote"),
+    createdCount: document.getElementById("createdCount"),
+    updatedCount: document.getElementById("updatedCount")
   };
 
   function currentDataset() { return DATASETS[state.view]; }
@@ -853,6 +857,27 @@ TAIL_TEMPLATE = r"""<script>
     });
   });
 
+  var POLL_INTERVAL_MS = 120000; // re-check data.json every 2 minutes, no manual reload needed
+  var hasLoadedOnce = false;
+
+  function pad2(n) { return n < 10 ? "0" + n : String(n); }
+
+  function nowClock() {
+    var d = new Date();
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  }
+
+  function applyMeta(data) {
+    if (els.metaMain) {
+      els.metaMain.textContent = "Data refreshed " + (data.pullDatetime || "—") +
+        " · age/staleness cutoff: on or before " + (data.cutoffDate || "—") +
+        " (" + (data.months != null ? data.months : "?") + " calendar months before pull date)";
+    }
+    if (els.createdCount) els.createdCount.textContent = (data.created || []).length.toLocaleString();
+    if (els.updatedCount) els.updatedCount.textContent = (data.updated || []).length.toLocaleString();
+    if (els.autoRefreshNote) els.autoRefreshNote.textContent = "auto-refreshing, last checked " + nowClock();
+  }
+
   function loadData() {
     fetch(DATA_URL, { cache: "no-store" })
       .then(function (res) {
@@ -864,17 +889,24 @@ TAIL_TEMPLATE = r"""<script>
           created: { records: data.created || [], dateField: "created", dateLabel: "Created", basisLabel: "days since created" },
           updated: { records: data.updated || [], dateField: "updated", dateLabel: "Last updated", basisLabel: "days since last update" }
         };
+        applyMeta(data);
+        hasLoadedOnce = true;
         render();
       })
       .catch(function (err) {
-        els.summaryRow.innerHTML = "";
-        els.tbody.innerHTML = "";
-        els.noResults.textContent = "Failed to load data.json: " + err.message + " (this page must be served over http/https, not opened directly as a file).";
-        els.noResults.style.display = "block";
+        if (!hasLoadedOnce) {
+          els.summaryRow.innerHTML = "";
+          els.tbody.innerHTML = "";
+          els.noResults.textContent = "Failed to load data.json: " + err.message + " (this page must be served over http/https, not opened directly as a file).";
+          els.noResults.style.display = "block";
+        } else if (els.autoRefreshNote) {
+          els.autoRefreshNote.textContent = "auto-refresh check failed at " + nowClock() + ", retrying…";
+        }
       });
   }
 
   loadData();
+  setInterval(loadData, POLL_INTERVAL_MS);
 })();
 </script>
 </body>
